@@ -1,0 +1,102 @@
+name: Publish validated CCM
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish-ccm.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download exact validated CCM single file
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://raw.githubusercontent.com/srhovo/toolbox/main/ccm/index.html \
+            --output index.html
+          test "$(git hash-object index.html)" = "0e2a6cba42507b4da11efe2d9466e5604c9857c0"
+          touch .nojekyll
+
+      - name: Static and JavaScript regression checks
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from html.parser import HTMLParser
+          import re
+
+          text = Path('index.html').read_text(encoding='utf-8')
+          required = [
+              '<title>老板扣卡管理系统</title>',
+              'id="boss-list"',
+              'id="add-boss-btn"',
+              'id="copy-and-consume-btn"',
+              'id="export-data-btn"',
+              'id="import-data-btn"',
+              'id="extract-order-btn"',
+              'class BossManager',
+              'class ClubCardApp'
+          ]
+          missing = [item for item in required if item not in text]
+          if missing:
+              raise SystemExit('missing CCM content: ' + ', '.join(missing))
+
+          class Parser(HTMLParser):
+              pass
+          parser = Parser()
+          parser.feed(text)
+
+          ids = re.findall(r'\bid="([^"]+)"', text)
+          duplicates = sorted({item for item in ids if ids.count(item) > 1})
+          if duplicates:
+              raise SystemExit('duplicate ids: ' + ', '.join(duplicates))
+
+          scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', text, re.S | re.I)
+          if len(scripts) != 1:
+              raise SystemExit(f'expected one inline script, got {len(scripts)}')
+          Path('/tmp/ccm.js').write_text(scripts[0], encoding='utf-8')
+          print('CCM static checks passed')
+          PY
+          node --check /tmp/ccm.js
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Real Chrome smoke test
+        shell: bash
+        run: |
+          timeout 45s chrome --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --allow-file-access-from-files --virtual-time-budget=4000 --dump-dom "file://${GITHUB_WORKSPACE}/index.html" > /tmp/ccm-dom.html
+          python - <<'PY'
+          from pathlib import Path
+          dom = Path('/tmp/ccm-dom.html').read_text(encoding='utf-8')
+          checks = {
+              'title': '老板扣卡管理系统' in dom,
+              'boss_list': 'id="boss-list"' in dom,
+              'consume': 'id="copy-and-consume-btn"' in dom,
+              'backup': 'id="export-data-btn"' in dom and 'id="import-data-btn"' in dom,
+              'status': 'id="status-bar"' in dom,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          if failed:
+              raise SystemExit(f'Chrome smoke failed: {failed}')
+          print('CCM Chrome smoke passed:', checks)
+          PY
+
+      - name: Commit validated site files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html .nojekyll
+          git commit -m "发布老板扣卡管理系统"
+          git push
